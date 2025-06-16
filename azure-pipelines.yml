@@ -1,0 +1,181 @@
+# azure-pipelines.yml
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  buildConfiguration: 'Release'
+
+stages:
+- stage: PolicyCheck
+  displayName: 'SGNL Policy Check'
+  jobs:
+  - job: CheckAccess
+    displayName: 'Check SGNL Access Policy'
+    steps:
+    - script: |
+        # Install curl and jq for API calls
+        sudo apt-get update
+        sudo apt-get install -y curl jq
+      displayName: 'Install dependencies'
+
+    - script: |
+        # Call SGNL Access API
+        RESPONSE=$(curl -s -X POST \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $(SGNL_TOKEN)" \
+          -d '{
+            "principal": {
+              "id": "$(Build.RequestedFor)"
+            },
+            "queries": [
+              {
+                "action": "deploy",
+                "assetId": "$(Build.Repository.Name)"
+              }
+            ]
+          }' \
+          https://access.sgnlapis.cloud/access/v2/evaluations)
+        
+        echo "SGNL Response: $RESPONSE"
+        
+        # Extract decision
+        DECISION=$(echo $RESPONSE | jq -r '.decisions[0].decision')
+        REASON=$(echo $RESPONSE | jq -r '.decisions[0].reason // "No reason provided"')
+        
+        echo "Decision: $DECISION"
+        echo "Reason: $REASON"
+        
+        # Set pipeline variables
+        echo "##vso[task.setvariable;variable=SGNL_DECISION;isOutput=true]$DECISION"
+        echo "##vso[task.setvariable;variable=SGNL_REASON;isOutput=true]$REASON"
+        
+        # Fail if access denied
+        if [ "$DECISION" != "Allow" ]; then
+          echo "##vso[task.logissue type=error]Access denied by SGNL policy: $REASON"
+          exit 1
+        fi
+      name: sgnlCheck
+      displayName: 'SGNL Policy Check'
+      env:
+        SGNL_TOKEN: $(SGNL_TOKEN)
+
+- stage: Build
+  displayName: 'Build and Test'
+  dependsOn: PolicyCheck
+  condition: succeeded()
+  jobs:
+  - job: Build
+    displayName: 'Build Job'
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '18.x'
+      displayName: 'Install Node.js'
+
+    - script: |
+        npm install
+        npm run build
+      displayName: 'npm install and build'
+
+    - script: |
+        npm test
+      displayName: 'Run tests'
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+
+- stage: Deploy_Staging
+  displayName: 'Deploy to Staging'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - deployment: Deploy_Staging
+    displayName: 'Deploy to Staging Environment'
+    environment: 'staging'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              # Additional SGNL check for staging deployment
+              RESPONSE=$(curl -s -X POST \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $(SGNL_TOKEN)" \
+                -d '{
+                  "principal": {
+                    "id": "$(Build.RequestedFor)"
+                  },
+                  "queries": [
+                    {
+                      "action": "deploy-staging",
+                      "assetId": "$(Build.Repository.Name)"
+                    }
+                  ]
+                }' \
+                https://access.sgnlapis.cloud/access/v2/evaluations)
+              
+              DECISION=$(echo $RESPONSE | jq -r '.decisions[0].decision')
+              
+              if [ "$DECISION" != "Allow" ]; then
+                echo "##vso[task.logissue type=error]Staging deployment denied by SGNL policy"
+                exit 1
+              fi
+            displayName: 'SGNL Staging Policy Check'
+            env:
+              SGNL_TOKEN: $(SGNL_TOKEN)
+
+          - script: |
+              echo "Deploying to staging environment..."
+              # Add your staging deployment logic here
+            displayName: 'Deploy to Staging'
+
+- stage: Deploy_Production
+  displayName: 'Deploy to Production'
+  dependsOn: Deploy_Staging
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: Deploy_Production
+    displayName: 'Deploy to Production Environment'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              # SGNL check for production deployment
+              RESPONSE=$(curl -s -X POST \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $(SGNL_TOKEN)" \
+                -d '{
+                  "principal": {
+                    "id": "$(Build.RequestedFor)"
+                  },
+                  "queries": [
+                    {
+                      "action": "deploy-production",
+                      "assetId": "$(Build.Repository.Name)"
+                    }
+                  ]
+                }' \
+                https://access.sgnlapis.cloud/access/v2/evaluations)
+              
+              DECISION=$(echo $RESPONSE | jq -r '.decisions[0].decision')
+              
+              if [ "$DECISION" != "Allow" ]; then
+                echo "##vso[task.logissue type=error]Production deployment denied by SGNL policy"
+                exit 1
+              fi
+            displayName: 'SGNL Production Policy Check'
+            env:
+              SGNL_TOKEN: $(SGNL_TOKEN)
+
+          - script: |
+              echo "Deploying to production environment..."
+              # Add your production deployment logic here
+            displayName: 'Deploy to Production'
